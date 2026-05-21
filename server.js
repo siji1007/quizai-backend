@@ -212,9 +212,10 @@ app.post('/generate-quiz', (req, res, next) => {
                 }
                 
                 IMPORTANT RULES FOR EACH TYPE:
-                - multiple-choice: "options" must have exactly 4 choices.
-                - true-false: "options" MUST always be ["True", "False"]. Never omit this field.
-                - situational: omit "options"; use "idealAnswer" instead.`;
+                - multiple-choice: "options" must be a valid JSON array containing exactly 4 string choices (e.g., ["Option 1", "Option 2", "Option 3", "Option 4"]).
+                - true-false: "options" MUST always be exactly ["True", "False"]. Never omit this field.
+                - situational: omit "options"; use "idealAnswer" instead.
+                CRITICAL: Ensure your entire response is 100% valid JSON. Do not use invalid syntax like \`options>[...]\` or \`options![...]\`. Use standard double quotes for properties and array values.`;
         } else {
             const explanationLang = req.body.language === 'Tagalog' ? 'Tagalog' : 'English';
             systemPrompt = `You are a genius AI tutor. Analyze the provided material and provide a comprehensive explanation or solution.
