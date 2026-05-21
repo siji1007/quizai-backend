@@ -10,6 +10,7 @@ dotenv.config();
 const app = express();
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 // ─── CORS ──────────────────────────────────────────────────────────────────
 const corsOptions = {
@@ -35,174 +36,113 @@ app.use((req, res, next) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  GROQ ROUND-ROBIN LOAD BALANCER
-//
-//  Each API key gets its own Groq client and its own independent processing
-//  lane (queue + rate-limit state). Incoming requests are distributed across
-//  lanes in round-robin order, so two simultaneous requests run in parallel
-//  on different keys instead of waiting behind each other in a single queue.
-//
-//  Free-tier limits per key: ~30 RPM / 1 req per 2 s.
+//  GROQ RATE-LIMIT QUEUE
+//  Groq free tier: ~1 request per 2 seconds (30 RPM).
+//  All Groq calls are funneled through this queue so concurrent users
+//  never trigger rate-limit errors; they simply wait their turn gracefully.
 // ═══════════════════════════════════════════════════════════════════════════
 
-const GROQ_MIN_INTERVAL_MS = 2100;   // 2.1 s gap per lane (safety margin above 30 RPM)
+const GROQ_MIN_INTERVAL_MS = 2100;   // 2.1 s gap between Groq calls (safety margin)
 const QUEUE_TIMEOUT_MS     = 120000; // Drop a job after 2 min if still waiting
 const MAX_RETRIES          = 3;      // Retry on transient Groq errors
 const RETRY_DELAY_MS       = 3000;   // Wait 3 s between retries
 
-// Build one lane per configured API key (gracefully skip missing keys)
-const API_KEYS = [
-    process.env.GROQ_API_KEY,
-    process.env.GROQ_API_KEY_ASSISTANT,
-].filter(Boolean);
-
-if (API_KEYS.length === 0) {
-    console.error('❌ No Groq API keys found in environment variables!');
-    process.exit(1);
-}
+let lastGroqCallAt = 0;           // Timestamp of the last completed Groq call
+let groqCallInProgress = false;   // Is a Groq call executing right now?
+const groqQueue = [];             // Pending { fn, resolve, reject, enqueuedAt, label } entries
 
 /**
- * A Lane encapsulates one Groq client + its own rate-limit queue.
- */
-function createLane(apiKey, index) {
-    const client = new Groq({ apiKey });
-    const queue  = [];
-    let lastCallAt      = 0;
-    let callInProgress  = false;
-    const name = `Lane-${index + 1}`;
-
-    async function processQueue() {
-        if (callInProgress) return;
-
-        const job = queue.shift();
-        if (!job) return;
-
-        if (Date.now() - job.enqueuedAt > QUEUE_TIMEOUT_MS) {
-            console.warn(`[${name}] ${job.label} timed out while waiting`);
-            job.reject(new Error('Request timed out while waiting in the processing queue. Please try again.'));
-            processQueue();
-            return;
-        }
-
-        callInProgress = true;
-
-        // Enforce per-lane rate limit
-        const msSinceLast = Date.now() - lastCallAt;
-        if (msSinceLast < GROQ_MIN_INTERVAL_MS) {
-            const waitMs = GROQ_MIN_INTERVAL_MS - msSinceLast;
-            console.log(`[${name}] ${job.label} waiting ${waitMs}ms for rate limit`);
-            await sleep(waitMs);
-        }
-
-        // Execute with retry logic
-        let lastError;
-        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-            try {
-                console.log(`[${name}] ${job.label} executing (attempt ${attempt}/${MAX_RETRIES})`);
-                lastCallAt = Date.now();
-                const result = await job.fn(client);
-                console.log(`[${name}] ${job.label} succeeded`);
-                job.resolve(result);
-                lastError = null;
-                break;
-            } catch (err) {
-                lastError = err;
-                const isRateLimit = err?.status === 429 || /rate.?limit/i.test(err?.message || '');
-                const isRetryable = isRateLimit || err?.status >= 500;
-
-                console.error(`[${name}] ${job.label} attempt ${attempt} failed: ${err.message}`);
-
-                if (attempt < MAX_RETRIES && isRetryable) {
-                    const delay = isRateLimit ? GROQ_MIN_INTERVAL_MS * 2 : RETRY_DELAY_MS;
-                    console.log(`[${name}] ${job.label} retrying in ${delay}ms...`);
-                    await sleep(delay);
-                    lastCallAt = Date.now();
-                }
-            }
-        }
-
-        if (lastError) {
-            console.error(`[${name}] ${job.label} failed after ${MAX_RETRIES} attempts`);
-            job.reject(lastError);
-        }
-
-        callInProgress = false;
-
-        if (queue.length > 0) {
-            setImmediate(processQueue);
-        }
-    }
-
-    return {
-        name,
-        queue,
-        get inProgress() { return callInProgress; },
-        enqueue(fn, label = 'groq-call') {
-            return new Promise((resolve, reject) => {
-                queue.push({ fn, resolve, reject, enqueuedAt: Date.now(), label });
-                console.log(`[${name}] ${label} enqueued | lane queue: ${queue.length}`);
-                processQueue();
-            });
-        },
-    };
-}
-
-// Instantiate all lanes
-const lanes = API_KEYS.map((key, i) => createLane(key, i));
-let roundRobinIndex = 0;
-
-/**
- * Pick the least-loaded lane (fewest pending jobs).
- * Falls back to pure round-robin when loads are equal.
- */
-function pickLane() {
-    // Choose the lane with the shortest queue (+ 1 if currently processing)
-    let best = lanes[0];
-    let bestLoad = best.queue.length + (best.inProgress ? 1 : 0);
-
-    for (let i = 1; i < lanes.length; i++) {
-        const load = lanes[i].queue.length + (lanes[i].inProgress ? 1 : 0);
-        if (load < bestLoad) {
-            best = lanes[i];
-            bestLoad = load;
-        }
-    }
-    return best;
-}
-
-/**
- * Public API: submit a Groq call to the best available lane.
- * @param {Function} fn    - async (groqClient) => result
- * @param {string}   label - human-readable label for logging
+ * Schedule a Groq API call through the queue.
+ * @param {Function} fn  - async function that returns the Groq response
+ * @param {string}   label - human-readable name for logging
+ * @returns Promise<any>
  */
 function enqueueGroqCall(fn, label = 'groq-call') {
-    const lane = pickLane();
-    return lane.enqueue(fn, label);
+    return new Promise((resolve, reject) => {
+        const enqueuedAt = Date.now();
+        groqQueue.push({ fn, resolve, reject, enqueuedAt, label });
+        console.log(`[Queue] ${label} enqueued | queue length: ${groqQueue.length}`);
+        processQueue();
+    });
+}
+
+async function processQueue() {
+    // Only one pump loop allowed at a time
+    if (groqCallInProgress) return;
+
+    const job = groqQueue.shift();
+    if (!job) return;
+
+    // Check timeout before executing
+    if (Date.now() - job.enqueuedAt > QUEUE_TIMEOUT_MS) {
+        console.warn(`[Queue] ${job.label} timed out while waiting in queue`);
+        job.reject(new Error('Request timed out while waiting in the processing queue. Please try again.'));
+        processQueue(); // Try next job
+        return;
+    }
+
+    groqCallInProgress = true;
+
+    // Enforce minimum interval between Groq API calls
+    const msSinceLast = Date.now() - lastGroqCallAt;
+    if (msSinceLast < GROQ_MIN_INTERVAL_MS) {
+        const waitMs = GROQ_MIN_INTERVAL_MS - msSinceLast;
+        console.log(`[Queue] ${job.label} waiting ${waitMs}ms for rate limit`);
+        await sleep(waitMs);
+    }
+
+    // Execute with retry logic
+    let lastError;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            console.log(`[Queue] ${job.label} executing (attempt ${attempt}/${MAX_RETRIES})`);
+            lastGroqCallAt = Date.now();
+            const result = await job.fn();
+            console.log(`[Queue] ${job.label} succeeded`);
+            job.resolve(result);
+            lastError = null;
+            break;
+        } catch (err) {
+            lastError = err;
+            const isRateLimit = err?.status === 429 || /rate.?limit/i.test(err?.message || '');
+            const isRetryable = isRateLimit || err?.status >= 500;
+
+            console.error(`[Queue] ${job.label} attempt ${attempt} failed: ${err.message}`);
+
+            if (attempt < MAX_RETRIES && isRetryable) {
+                const delay = isRateLimit ? GROQ_MIN_INTERVAL_MS * 2 : RETRY_DELAY_MS;
+                console.log(`[Queue] ${job.label} retrying in ${delay}ms...`);
+                await sleep(delay);
+                lastGroqCallAt = Date.now(); // Reset timer after waiting
+            }
+        }
+    }
+
+    if (lastError) {
+        console.error(`[Queue] ${job.label} failed after ${MAX_RETRIES} attempts`);
+        job.reject(lastError);
+    }
+
+    groqCallInProgress = false;
+
+    // Schedule next job — small tick to avoid synchronous stack overflow
+    if (groqQueue.length > 0) {
+        setImmediate(processQueue);
+    }
 }
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-console.log(`✅ Groq load balancer initialised with ${lanes.length} lane(s): ${lanes.map(l => l.name).join(', ')}`);
-
 // ─── Queue Status Endpoint (optional monitoring) ──────────────────────────
 app.get('/queue-status', (req, res) => {
-    const laneStats = lanes.map((lane) => ({
-        lane: lane.name,
-        queueLength: lane.queue.length,
-        processing: lane.inProgress,
-        estimatedWaitSeconds: Math.ceil(
-            (lane.queue.length + (lane.inProgress ? 1 : 0)) * (GROQ_MIN_INTERVAL_MS / 1000)
-        ),
-    }));
-
-    const totalPending = laneStats.reduce((sum, l) => sum + l.queueLength + (l.processing ? 1 : 0), 0);
-
     res.json({
-        lanes: laneStats,
-        totalPending,
-        estimatedWaitSeconds: Math.ceil(totalPending / lanes.length * (GROQ_MIN_INTERVAL_MS / 1000)),
+        queueLength: groqQueue.length,
+        processing: groqCallInProgress,
+        estimatedWaitSeconds: Math.ceil(
+            (groqQueue.length + (groqCallInProgress ? 1 : 0)) * (GROQ_MIN_INTERVAL_MS / 1000)
+        ),
     });
 });
 
@@ -268,21 +208,28 @@ app.post('/generate-quiz', (req, res, next) => {
                       "explanation": "Genius-level explanation"
                     }
                   ]
-                }`;
+                }
+                
+                IMPORTANT RULES FOR EACH TYPE:
+                - multiple-choice: "options" must have exactly 4 choices.
+                - true-false: "options" MUST always be ["True", "False"]. Never omit this field.
+                - situational: omit "options"; use "idealAnswer" instead.`;
         } else {
+            const explanationLang = req.body.language === 'Tagalog' ? 'Tagalog' : 'English';
             systemPrompt = `You are a genius AI tutor. Analyze the provided material and provide a comprehensive explanation or solution.
                 
                 RULES:
                 1. If it's a question or math problem, solve it step-by-step.
                 2. If it's a concept or object, explain what it is, its significance, and key facts.
                 3. Use clear, professional, and encouraging language.
+                4. The explanation content MUST be written in ${explanationLang}.
                 
                 STRICT FORMATTING REQUIREMENTS:
                 Return ONLY a valid JSON object:
                 {
                   "type": "explanation",
-                  "title": "Identification/Subject Title",
-                  "content": "Comprehensive markdown-formatted explanation or solution"
+                  "title": "Identification/Subject Title (in ${explanationLang})",
+                  "content": "Comprehensive markdown-formatted explanation or solution in ${explanationLang}"
                 }`;
         }
 
@@ -330,14 +277,15 @@ app.post('/generate-quiz', (req, res, next) => {
             return res.status(400).json({ error: 'Either a file upload or a topic is required.' });
         }
 
-        // ── Run through the load-balanced queue ─────────────────────────
-        const totalPending = lanes.reduce((sum, l) => sum + l.queue.length + (l.inProgress ? 1 : 0), 0);
-        if (totalPending > 0) {
-            console.log(`[Balancer] generate-quiz: ${totalPending} request(s) across all lanes`);
+        // ── Inform the client how many are ahead in the queue ────────────
+        const queuePosition = groqQueue.length + (groqCallInProgress ? 1 : 0);
+        if (queuePosition > 0) {
+            console.log(`[Queue] generate-quiz: ${queuePosition} request(s) ahead`);
         }
 
-        const responseContent = await enqueueGroqCall(async (groqClient) => {
-            const completion = await groqClient.chat.completions.create({
+        // ── Run through the queue ────────────────────────────────────────
+        const responseContent = await enqueueGroqCall(async () => {
+            const completion = await groq.chat.completions.create({
                 messages,
                 model,
                 response_format: { type: 'json_object' }
@@ -377,8 +325,13 @@ app.post('/grade-situational', async (req, res) => {
             return res.status(400).json({ error: 'question, idealAnswer, and userAnswer are required.' });
         }
 
-        const result = await enqueueGroqCall(async (groqClient) => {
-            const completion = await groqClient.chat.completions.create({
+        const queuePosition = groqQueue.length + (groqCallInProgress ? 1 : 0);
+        if (queuePosition > 0) {
+            console.log(`[Queue] grade-situational: ${queuePosition} request(s) ahead`);
+        }
+
+        const result = await enqueueGroqCall(async () => {
+            const completion = await groq.chat.completions.create({
                 messages: [
                     {
                         role: 'system',
