@@ -192,6 +192,7 @@ app.post('/generate-quiz', (req, res, next) => {
                 1. TEXT/NOTES: Extract core concepts and generate questions testing deep understanding.
                 2. OBJECTS/PHOTOS: Identify the subject and generate facts/history/science questions.
                 3. DIAGRAMS: Create questions that analyze the data or processes shown.
+                4. PLAIN TEXT ONLY: Do not use any markdown formatting (like **bold**, *italics*, # headings) or special characters. Keep all text completely clean and easy to read aloud.
 
                 STRICT FORMATTING REQUIREMENTS:
                 Return ONLY a valid JSON object:
@@ -222,14 +223,15 @@ app.post('/generate-quiz', (req, res, next) => {
                 1. If it's a question or math problem, solve it step-by-step.
                 2. If it's a concept or object, explain what it is, its significance, and key facts.
                 3. Use clear, professional, and encouraging language.
-                4. The explanation content MUST be written in ${explanationLang}.
+                4. PLAIN TEXT ONLY: Do not use any markdown formatting (like **bold**, *italics*, # headings) or special characters. Keep the text completely clean and easy to read aloud.
+                5. The explanation content MUST be written in ${explanationLang}.
                 
                 STRICT FORMATTING REQUIREMENTS:
                 Return ONLY a valid JSON object:
                 {
                   "type": "explanation",
                   "title": "Identification/Subject Title (in ${explanationLang})",
-                  "content": "Comprehensive markdown-formatted explanation or solution in ${explanationLang}"
+                  "content": "Comprehensive plain-text explanation or solution in ${explanationLang}"
                 }`;
         }
 
